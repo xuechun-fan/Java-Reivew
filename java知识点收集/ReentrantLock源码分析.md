@@ -105,7 +105,7 @@ ReentrantLock实例对象lock持有sync实例变量。![image-20210417204940233]
         if (!tryAcquire(arg) &&	 //如果获取到了锁，tryAcquire()方法返回true，则该行代码取反结果为false，&&短路作用，acquire()方法直接返回，一直向上返回到lock.lock()的调用处，也就是意味着锁是空闲的，当前线程现在已经成功获取到了锁，可以接着执行需要lock.lock()方法调用后面的代码块,
             //如果没有获取到锁，即当前锁已被占有，那么上一行代码就是true，转而会接着该行代码，首先分析addWaiter(Node.EXCLUSIVE) 
             // Node.EXCLUSIVE for exclusive, Node.SHARED for shared
-            acquireQueued(addWaiter(Node.EXCLUSIVE), arg))	//acquireQueued方法见下方Code2源码解析
+            acquireQueued(addWaiter(Node.EXCLUSIVE), arg))	//acquireQueued方法见下方Code2源码解析，总的来说就是在当前线程无法获取到锁的时候，则会将当前线程封装成Node节点加入到CHL队列尾部，并以独占式的方式尝试获取锁，如果
             selfInterrupt();   |	//	如果。。。，中断当前线程
     }                          |
                                |
@@ -172,10 +172,7 @@ public final void acquire(int arg) 方法定义在AQS抽象类中，并使用了
 #### Code1、trytryAcquire(int acquires)源码解析
 
 ```java
-/**
-* Fair version of tryAcquire.  Don't grant access unless
-* recursive call or no waiters or is first.
-*/
+//	通过CAS尝试去获取锁，包含了可重入锁的逻辑
 protected final boolean tryAcquire(int acquires) {
     final Thread current = Thread.currentThread();//获取当前线程
     int c = getState();//获取当前锁的状态
@@ -213,31 +210,73 @@ public final boolean hasQueuedPredecessors() {
 	/**
      * Acquires in exclusive uninterruptible mode for thread already in
      * queue. Used by condition wait methods as well as acquire.
-     *
-     * @param node ：
-     * @param arg the acquire argument
+     * 以独占非终端模式获取已在队列中的线程。用于条件等待方法以及获取。
+     * @param node ：由addWaiter(Node.EXCLUSIVE)返回的当前线程封装成的Node节点
+     * @param arg ：要更新的state值
      * @return {@code true} if interrupted while waiting
      */
     final boolean acquireQueued(final Node node, int arg) {
-        boolean failed = true;
+        boolean failed = true;//是否获取到锁的标志位
         try {
             boolean interrupted = false;
-            for (;;) {
-                final Node p = node.predecessor();
-                if (p == head && tryAcquire(arg)) {
-                    setHead(node);
-                    p.next = null; // help GC
-                    failed = false;
-                    return interrupted;
+            for (;;) {//死循环
+                final Node p = node.predecessor();//p指向当前线程node的前驱节点
+                if (p == head && tryAcquire(arg)) {//如果当前线程是dummy哑节点后的第一个有效节点的话，则会一直尝试CAS操作获取锁，直到获取锁成功
+                    setHead(node);//获取锁成功之后，将当前线程节点CAS设置为head节点
+                    p.next = null; // help GC，将原来的前驱节点，即头节点置为null，方便GC回收
+                    failed = false;//更新标志位
+                    return interrupted;//返回中断标志位
                 }
-                if (shouldParkAfterFailedAcquire(p, node) &&
-                    parkAndCheckInterrupt())
+                if (shouldParkAfterFailedAcquire(p, node) &&//检查前驱节点线程的waitStatus状态，详情见Code3源码解析，如果前驱节点状态已经是SIGNAL，说明前面的线程已经释放了锁，这个时候我们继续判断下一个条件，否则就是一直自旋，直到改变前驱节点waitStatus的值为SIGNAL，然后进行下一步判断
+                    parkAndCheckInterrupt())//park挂起当前线程，并返回当前线程的中断状态，如果中断状态为true，则更新interrupted = true;
                     interrupted = true;
             }
         } finally {
             if (failed)
-                cancelAcquire(node);
+                cancelAcquire(node);//Cancels an ongoing attempt to acquire.就是说如果中断发生了，当前线程还没有获取到锁，则会取消当前线程node的自旋，并挂起该线程
         }
+    }
+```
+
+#### Code3、shouldParkAfterFailedAcquire方法源码解析
+
+```java
+    /**
+     * Checks and updates status for a node that failed to acquire.
+     * Returns true if thread should block. This is the main signal
+     * control in all acquire loops.  Requires that pred == node.prev.
+     *
+     * @param pred node's predecessor holding status
+     * @param node the node
+     * @return {@code true} if thread should block
+     */
+    private static boolean shouldParkAfterFailedAcquire(Node pred, Node node) {
+        int ws = pred.waitStatus;
+        if (ws == Node.SIGNAL)//此节点已设置状态，请求释放以向其发送信号，因此它可以安全地park。park作用就是挂起当前线程
+            /*
+             * This node has already set status asking a release
+             * to signal it, so it can safely park.
+             */
+            return true;
+        if (ws > 0) {
+            /*
+             * Predecessor was cancelled. Skip over predecessors and
+             * indicate retry.
+             * 前驱节点的ws大于0，代表它取消了等待，所以需要将取消等待的节点移除队列
+             */
+            do {
+                node.prev = pred = pred.prev;
+            } while (pred.waitStatus > 0);
+            pred.next = node;
+        } else {
+            /* waitStatus必须为0或-3。指示我们需要signal，但不要park挂起线程。caller调用者将需要重试，以确保在park挂起前无法获取。
+             * waitStatus must be 0 or PROPAGATE.  Indicate that we
+             * need a signal, but don't park yet.  Caller will need to
+             * retry to make sure it cannot acquire before parking.
+             */
+            compareAndSetWaitStatus(pred, ws, Node.SIGNAL);//CAS设置前驱节点的状态为SIGNAL
+        }
+        return false;
     }
 ```
 
